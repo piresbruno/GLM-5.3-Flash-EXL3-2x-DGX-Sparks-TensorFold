@@ -5,6 +5,11 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **`./start.sh` no longer mistakes a running container for a serving one**: it skipped the start whenever the
+  containers were up, even when rank 0 had been left on another port (a harness that injects `PORT`, as the irori
+  driver does) or was wedged. The engine kept its unified memory while `:8081` stayed dead, and every later
+  `./start.sh` said "nothing to do". It now skips only when `/v1/models` answers on this start's `PORT`; otherwise it
+  stops the ranks and starts them again. A start still in progress is caught by the existing lock.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round

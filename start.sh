@@ -159,9 +159,14 @@ need_workers
 # ---------------------------------------------------------------- already running?
 all_running() { local i; running_here || return 1; for i in $(worker_ids); do running_worker "$i" || return 1; done; }
 if (( ! DRY )) && [[ "$MODE" == start ]] && all_running; then
-  log "$CONTAINER_NAME is already running on $SPARKS (model: $(served_name || echo "not answering yet"), port $PORT): nothing to do."
-  log "Use ./start.sh restart to restart it (e.g. with new settings), or ./stop.sh to stop it."
-  exit 0
+  # A running container is not a serving one: a harness that injects PORT can leave it on another port, or it can be
+  # wedged. Skip only when the API answers on this start's $PORT; otherwise fall through to the stop and start below.
+  if served=$(served_name) && [[ -n "$served" ]]; then
+    log "$CONTAINER_NAME is already running on $SPARKS (model: $served, port $PORT): nothing to do."
+    log "Use ./start.sh restart to restart it (e.g. with new settings), or ./stop.sh to stop it."
+    exit 0
+  fi
+  log "$CONTAINER_NAME is running on $SPARKS but $URL is not answering: stopping it, then starting again"
 fi
 
 # ---------------------------------------------------------------- 1. setup
