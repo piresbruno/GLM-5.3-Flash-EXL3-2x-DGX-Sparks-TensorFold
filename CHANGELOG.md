@@ -5,6 +5,15 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **Every rank ends when a rank it needs is gone** (patch `0133-cuda-peer-watch`, upstream PR #138 by
+  [BadAd84](https://github.com/BadAd84), its 0131 renumbered): a thread on each rank checks in with the rendezvous
+  store every 2 s. Rank 0 exits (code 1) when another rank shows no sign of life for `TENSORFOLD_PEER_TIMEOUT_S`
+  (default 120; 0: never) or starts again, and removes the old NCCL id so a restarted worker cannot reuse it; a worker
+  exits when rank 0's store is gone. The systemd unit then starts every rank again as a new set. `start.sh` already
+  stopped rank 0 when a worker's container exited; this adds a rank that hangs or a Spark out of reach. The store's
+  port (`MASTER_PORT`, 29551) is not firewalled here, so anything on the LAN that writes to it can end the ranks.
+  CPU check: `tools/peer_watch_check.py`.
+
 - **A kept state's small part counts against `SPILL_RELEASE_MIB`** (patches `0128-glm-spill-blocks` and
   `0129-glm-kv-shard` replaced by upstream PR #222's versions, by [wojo](https://github.com/wojo)): each keep copied its
   ~91 MB small state, and the block its end cuts, to host memory without counting them, so a spill writer that fell
