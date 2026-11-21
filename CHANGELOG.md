@@ -13,6 +13,11 @@ Every change to this recipe, newest first. Each release names the image it serve
   the oldest waiting prompt (the one `next_fill` already picks) goes in first and takes up to that many rows, the
   others follow shortest first, and it takes what they leave. Rank 0 decides; the other ranks apply its `MFILL`. Same
   replies. Off is the packing as before, checked on 3,000 random sets. CPU check: `tools/fill_oldest_check.py`.
+  **Measured, not kept:** at 512 (8 sessions, the baseline's seed) big prompts prefilled 3-4x slower (523-621
+  against 1,591-2,109 tok/s; a 190k turn's first token 206 -> 742 s). Shortest first lets a big prompt fill most
+  chunks alone at nearly one request's speed, and a chunk costs about the same with 512 of its rows as with 2,048
+  (a pass over the weights and attention over its history), so the queue is prefill capacity, not the order. Leave
+  it at 0.
 
 - **Every rank ends when a rank it needs is gone** (patch `0133-cuda-peer-watch`, upstream PR #138 by
   [BadAd84](https://github.com/BadAd84), its 0131 renumbered): a thread on each rank checks in with the rendezvous
