@@ -185,7 +185,10 @@ class Monitor(threading.Thread):
                 row["health"]["spill"] = {k: (h.get("spill") or {}).get(k) for k in (
                     "stored_bytes", "cap_bytes", "entries", "loaded", "loaded_tokens", "load_failed", "crc_failed",
                     "write_failed", "no_space", "dropped", "unwritten_evicted", "quota_trims", "disk_hits",
-                    "disk_lookups", "restore_ms_p95", "disk_free_bytes")}
+                    "disk_lookups", "restore_ms_p95", "disk_free_bytes",
+                    # the writer's backlog and patch 0128's host-memory cap (PR #222): what a slow disk shows
+                    "pending", "backlog_mb", "host_mb", "release_cap_mb", "release_dropped", "backlog_skipped",
+                    "written_total_bytes")}
             except Exception as exc:                      # noqa: BLE001 - a down server is a finding, not a crash
                 row["health_error"] = str(exc)[:200]
                 self.down_since = self.down_since or time.time()

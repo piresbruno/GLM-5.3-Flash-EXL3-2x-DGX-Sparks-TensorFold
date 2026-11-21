@@ -5,6 +5,20 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A kept state's small part counts against `SPILL_RELEASE_MIB`** (patches `0128-glm-spill-blocks` and
+  `0129-glm-kv-shard` replaced by upstream PR #222's versions, by [wojo](https://github.com/wojo)): each keep copied its
+  ~91 MB small state, and the block its end cuts, to host memory without counting them, so a spill writer that fell
+  behind could hold any amount of the unified memory earlyoom watches. They now count against the cap before they are
+  copied; past it the state is not stored (`/health` `spill.release_dropped`). With `TF_GLM_KV_SHARD=1` a rank also
+  counts only the rows it holds (0129's `host_bytes` grew without bound). CPU checks: `tools/spill_blocks_check.py`
+  (187), `tools/kv_shard_check.py`.
+- **GLM tool calls stream while they decode** (patch `0132-glm-stream-tool-calls`, upstream PR #244 by
+  [nuk3s](https://github.com/nuk3s)): a streamed call's header goes out once its name is complete and offered, and its
+  string arguments as JSON-escaped pieces as they decode, so a large Write call no longer arrives in one piece after
+  minutes of silence. A call cut off by the token limit now arrives half-sent, as vLLM's and Anthropic's do.
+  Non-streamed requests and `parallel_tool_calls: false` are unchanged. CPU check: `tools/stream_tool_calls_check.py`
+  (27 cases, a 20,000-reply fuzz).
+
 - **Long-session stress test and spill-prune probe** (`tools/long_sessions.py`, `tools/spill_prune_probe.py`): agent
   sessions shaped on production's 2026-11-19 spill store (turn sizes, think times, a 10.8k shared system block),
   growing to 230k tokens, in phases (`--phases`, default 2, 8, then 12 sessions, an idle gap and a return turn each).
