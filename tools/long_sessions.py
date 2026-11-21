@@ -141,8 +141,11 @@ def nodes_from_local_sh() -> list[str]:
     return ["local"] + found
 
 
-MEM_LOOP = ("while :; do awk '/MemTotal|MemAvailable/{printf \"%s \", $2}' /proc/meminfo; "
-            "ps -C tensorfold -o rss= | awk '{s+=$1} END{print s+0}'; sleep INTERVAL; done")
+# bash prints each line itself, so it dies of SIGPIPE when the reader (ssh) goes: with awk printing, only awk died and
+# the loop outlived every run on the workers
+MEM_LOOP = ("while :; do l=\"$(awk '/MemTotal|MemAvailable/{printf \"%s \", $2}' /proc/meminfo)"
+            "$(ps -C tensorfold -o rss= | awk '{s+=$1} END{print s+0}')\"; printf '%s\\n' \"$l\" || exit; "
+            "sleep INTERVAL; done")
 
 
 class Monitor(threading.Thread):

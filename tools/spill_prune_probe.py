@@ -57,6 +57,22 @@ def tokens_of(key: str) -> int:
     return int(key.rsplit("-", 1)[1])
 
 
+def wait_full_state(points: str, before: set[str], prompt: int, timeout=600) -> set[str]:
+    """The keys a target added, once its full-context state (within 512 tokens of its prompt) is on disk and nothing
+    more arrives for 10 s. /health's pending reads 0 before the last turn's keep is queued (2026-11-21: the 191808-token
+    state landed after a diff taken then), so the files decide."""
+    end, last, since = time.time() + timeout, None, time.time()
+    while time.time() < end:
+        new = keys(points) - before
+        if new != last:
+            last, since = new, time.time()
+        elif new and max(map(tokens_of, new)) >= prompt - 512 and time.time() - since >= 10:
+            return new
+        time.sleep(2)
+    raise RuntimeError(f"no state within 512 tokens of {prompt} reached the spill store in {timeout} s "
+                       f"(new keys: {sorted(map(tokens_of, last or ()))})")
+
+
 def wait_spill_idle(timeout=300):
     """Until the spill tier has written what it keeps (its pending count 0)."""
     time.sleep(3)                                             # the keep's write is queued just after the reply ends
@@ -74,16 +90,18 @@ def written_bytes() -> int:
 class Target(L.Synthetic):
     """A conversation behind its own system prompt, grown to ~size tokens in three turns."""
 
-    def __init__(self, sid, size):
-        super().__init__(sid, random.Random(sid), grow_to=10**9)
-        self.size = size
-        self.system = L.text_of(L.SYSTEM_TOKENS, 90_000 + sid)  # its own: not a prefix the pressure shares
-        self._fresh(opening=L.text_of(200, 91_000 + sid))
+    def __init__(self, sid, size, salt):
+        super().__init__(sid, random.Random(salt + sid), grow_to=10**9)
+        self.size, self.salt = size, salt
+        # its own system prompt (not a prefix the pressure shares), salted per run: a rerun's identical text would
+        # resume from the states an earlier run left and add no keys of its own
+        self.system = L.text_of(L.SYSTEM_TOKENS, salt + 90_000 + sid)
+        self._fresh(opening=L.text_of(200, salt + 91_000 + sid))
         self.keys: set[str] = set()
 
     def grow(self, add: int):
-        self.messages.append({"role": "user", "content": "Tool output:\n" + L.text_of(add, 92_000 + self.sid * 10
-                                                                                       + len(self.messages))})
+        self.messages.append({"role": "user", "content": "Tool output:\n" + L.text_of(
+            add, self.salt + 92_000 + self.sid * 10 + len(self.messages))})
 
 
 def build(targets, size, points, log):
@@ -98,16 +116,15 @@ def build(targets, size, points, log):
             if i < 2:
                 t.grow(step)
             t.prompt = r["prompt"]
-        wait_spill_idle()
-        t.keys = keys(points) - before
+        t.keys = wait_full_state(points, before, t.prompt)
         t.last_used = time.time()
         log({"event": "built", "target": t.sid, "prompt": t.prompt, "keys": sorted(t.keys, key=tokens_of),
              "secs": round(time.time() - t.last_used, 1)})
         print(f"  target {t.sid}: {t.prompt} tokens, spill keys {sorted(tokens_of(k) for k in t.keys)}", flush=True)
 
 
-def pressure(n, stop, scale, max_gap, log):
-    rng = random.Random(4242)
+def pressure(n, stop, scale, max_gap, log, salt):
+    rng = random.Random(salt)
     sessions = [L.Synthetic(100 + i, random.Random(rng.random()), 230_000) for i in range(n)]
 
     def loop(s):
@@ -152,6 +169,8 @@ def main() -> int:
     ap.add_argument("--max-gap", type=float, default=120)
     ap.add_argument("--nodes", type=lambda v: v.split(","), default=L.nodes_from_local_sh())
     ap.add_argument("--out", default=time.strftime("spill-prune-%Y%m%d-%H%M%S"))
+    ap.add_argument("--salt", type=int, default=int(time.time()) % 10**7 * 1000,
+                    help="seeds this run's prose (default: from the clock, so reruns share no text)")
     a = ap.parse_args()
     try:
         h0 = L.health()
@@ -176,7 +195,7 @@ def main() -> int:
     mon = L.Monitor(open(os.path.join(a.out, "monitor.jsonl"), "w"), a.nodes, stop)
     mon.phase = "build"
     mon.start()
-    targets = [Target(i, a.size) for i in range(a.targets)]
+    targets = [Target(i, a.size, a.salt) for i in range(a.targets)]
     gone: dict[str, dict] = {}
     workers: list[threading.Thread] = []
     try:
@@ -186,7 +205,7 @@ def main() -> int:
         w0, t0 = written_bytes(), time.time()
         print(f"== pressure: {a.sessions} sessions until every target's largest state is gone "
               f"(at most {a.max_minutes} min)", flush=True)
-        workers = pressure(a.sessions, stop, a.time_scale, a.max_gap, log)
+        workers = pressure(a.sessions, stop, a.time_scale, a.max_gap, log, a.salt)
         while not stop.is_set() and time.time() - t0 < a.max_minutes * 60:
             now, present = time.time(), keys(points)
             h = L.health()

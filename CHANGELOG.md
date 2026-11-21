@@ -16,8 +16,10 @@ Every change to this recipe, newest first. Each release names the image it serve
   rank 0's `points/` folder for when each is pruned, then times a resume. At `PARALLEL=8` with 3 ranks, 32 GiB spill,
   52 + 23 min: 0 errors, later turns resumed p10 100%, recall 119/119 (up to 230k), memory flat, and a ~200k
   context came back in 0.8-2.1 s. Under 8 agents (spill written at ~2.2 GiB/min) an idle ~192k conversation is pruned
-  after 30-33 min, down to its ~10k opening, and resuming it then takes 83 s. Offline tests:
-  `tests/test_long_sessions.py`.
+  after 30-33 min, down to its ~10k opening, and resuming it then takes 83 s. With `SPILL_GIB=128` the same load
+  prunes it after 167.6-170.8 min (5.5x for 4x the store), after which a resume still takes 83-84 s. Offline tests:
+  `tests/test_long_sessions.py`. The memory sampler's loop now exits with its ssh session (it outlived every run on
+  the workers), and the probe waits for each target's full-context state on disk and salts each run's text.
 
 - **`./start.sh` no longer mistakes a running container for a serving one**: it skipped the start whenever the
   containers were up, even when rank 0 had been left on another port (a harness that injects `PORT`, as the irori
