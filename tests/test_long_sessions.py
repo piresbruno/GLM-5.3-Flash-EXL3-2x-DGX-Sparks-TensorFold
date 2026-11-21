@@ -105,5 +105,42 @@ class SummaryTests(unittest.TestCase):
         self.assertIn(f"memory stayed above {ls.GUARD_GIB} GiB", s["failed"])
 
 
+def hmon(t, running, prefilling, decoding=0, paused=0, free=0.5):
+    return {"t": t, "phase": "steady", "mem": {},
+            "health": {"requests_running": running, "pool_free_tokens": int(free * 1000), "pool_tokens": 1000,
+                       "kept_bytes": 0,
+                       "streams": {"decoding": decoding, "prefilling": prefilling, "paused": paused}}}
+
+
+class QueueTests(unittest.TestCase):
+    def test_held_is_accepted_minus_placed(self):
+        self.assertEqual(ls.held_of(hmon(0, 6, 4, decoding=1)["health"]), 1)
+        self.assertEqual(ls.held_of(hmon(0, 3, 4)["health"]), 0)            # never negative
+        self.assertEqual(ls.held_of({}), 0)
+
+    def test_slow_wait_admitted_behind_fills(self):
+        r = turn("steady", 2, 4, 210000, 10000, 9984, ttft=200.0, wall=210.0, prefill_s=100.0)
+        r["t"] = 1000.0                                                       # it started at 790
+        mon = [hmon(800 + i * 10, 5, 5, free=0.3) for i in range(18)]
+        w = ls.slow_waits([r], mon)
+        self.assertEqual(len(w), 1)
+        self.assertEqual(w[0]["held_share"], 0.0)
+        self.assertEqual(w[0]["queue_s"], 100.0)
+        self.assertEqual(w[0]["prefilling_avg"], 5.0)
+        self.assertEqual(w[0]["pool_free_min"], 0.3)
+
+    def test_fast_turns_are_not_broken_down(self):
+        r = turn("steady", 2, 4, 30000, 29952, 29952, ttft=2.0)
+        self.assertEqual(ls.slow_waits([r], [hmon(1000, 1, 1)]), [])
+
+    def test_big_turns_per_phase(self):
+        rows = [turn("steady", 0, 1, 80000, 10000, 9984, ttft=150.0, prefill_s=40.0),
+                turn("steady", 1, 1, 30000, 29952, 29952, ttft=1.0)]
+        s = ls.summarize(rows, [mon(0, "steady", 15)], H, H, 100, None)
+        self.assertEqual(s["phases"]["steady"]["big_turns"], 1)
+        self.assertEqual(s["phases"]["steady"]["big_ttft_p95"], 150.0)
+        self.assertEqual(s["phases"]["steady"]["big_queue_s_p50"], 110.0)
+
+
 if __name__ == "__main__":
     unittest.main()

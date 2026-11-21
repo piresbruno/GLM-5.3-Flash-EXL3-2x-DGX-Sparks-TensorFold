@@ -471,6 +471,40 @@ def pct(xs, p):
     return round(xs[min(len(xs) - 1, int(len(xs) * p))], 3) if xs else None
 
 
+SLOW_TTFT_S = 60                                             # a turn's wait is broken down past this first-token time
+BIG_TURN = 50_000                                            # turns adding this many new tokens: the A/B's measure
+
+
+def held_of(h: dict) -> int:
+    """Requests accepted but in no slot (held for room or for a slot): /health has no waiting count, but
+    requests_running counts every accepted request and streams only those placed."""
+    s = h.get("streams") or {}
+    return max(0, (h.get("requests_running") or 0) - sum(s.get(k, 0) for k in ("decoding", "prefilling", "paused")))
+
+
+def slow_waits(turns: list[dict], mon: list[dict]) -> list[dict]:
+    """For each turn past SLOW_TTFT_S, what the server did while it waited for its first token: the share of samples
+    with a request held (room or slot), how many prompts were prefilling at once, and the least free pool. Mostly held:
+    the pool or the slots are the limit; mostly admitted with several prefilling: the fill order is."""
+    hs = [m for m in mon if "health" in m]
+    out = []
+    for r in turns:
+        if (r.get("ttft") or 0) <= SLOW_TTFT_S:
+            continue
+        start = r["t"] - r["wall"]
+        w = [m["health"] for m in hs if start <= m["t"] <= start + r["ttft"]]
+        if not w:
+            continue
+        out.append({"phase": r["phase"], "sid": r["sid"], "turn": r["turn"], "new": r["prompt"] - r["cached"],
+                    "ttft": round(r["ttft"], 1), "prefill_s": r.get("prefill_s"),
+                    "queue_s": round(r["ttft"] - (r.get("prefill_s") or 0), 1),
+                    "held_share": round(sum(held_of(h) > 0 for h in w) / len(w), 2),
+                    "prefilling_avg": round(statistics.fmean((h.get("streams") or {}).get("prefilling", 0) for h in w), 1),
+                    "pool_free_min": round(min(h["pool_free_tokens"] / h["pool_tokens"] for h in w
+                                               if h.get("pool_tokens")), 3)})
+    return out
+
+
 def slope_gib_h(points: list[tuple[float, float]], min_span: float = 0) -> float | None:
     """Least-squares slope of (time s, GiB) in GiB an hour; None on fewer than 6 points or under ``min_span`` s."""
     if len(points) < 6 or points[-1][0] - points[0][0] < min_span:
@@ -502,6 +536,9 @@ def summarize(rows, mon, h0, h1, secs, guard) -> dict:
             p["decode"].append(r["completion"] / r["decode_s"])
         if r.get("prefill_s") and r["prompt"] - r["cached"] > 2048:
             p["prefill_rate"].append((r["prompt"] - r["cached"]) / r["prefill_s"])
+        if r["prompt"] - r["cached"] >= BIG_TURN:
+            p.setdefault("big_ttft", []).append(r["ttft"])
+            p.setdefault("big_queue", []).append((r["ttft"] or 0) - (r.get("prefill_s") or 0))
     per_phase = {}
     for name, p in phases.items():
         span = max(p["t"]) - min(p["t"]) if len(p["t"]) > 1 else None
@@ -510,7 +547,9 @@ def summarize(rows, mon, h0, h1, secs, guard) -> dict:
             "reuse": round(1 - p["prefilled"] / p["prompt"], 3) if p["prompt"] else None, "http_429": p["busy"],
             "ttft_p50": pct(p["ttft"], .5), "ttft_p95": pct(p["ttft"], .95), "wall_p95": pct(p["wall"], .95),
             "decode_tok_s_p50": pct(p["decode"], .5), "prefill_tok_s_p50": pct(p["prefill_rate"], .5),
-            "completion_tok_s": round(p["completion"] / span, 1) if span else None}
+            "completion_tok_s": round(p["completion"] / span, 1) if span else None,
+            "big_turns": len(p.get("big_ttft", [])), "big_ttft_p95": pct(p.get("big_ttft", []), .95),
+            "big_queue_s_p50": pct(p.get("big_queue", []), .5)}
     nodes = sorted({n for m in mon for n in m.get("mem", {})})
     mem = {}
     for n in nodes:
@@ -570,6 +609,7 @@ def summarize(rows, mon, h0, h1, secs, guard) -> dict:
         "kept_bytes_max_gib": round(kept_max / 2**30, 2), "paused_s": paused, "spill": spill_delta,
         "spill_end": {k: sp1.get(k) for k in ("stored_gib", "entries", "cap_bytes", "restore_ms_p95")},
         "big_misses": [{k: r[k] for k in ("phase", "sid", "turn", "prompt", "cached", "miss", "wall")} for r in big],
+        "slow_waits": slow_waits(turns, mon),
         "recall_by_depth": [(r["depth"], r["correct"]) for r in recalls],
         "checks": {k: {"ok": ok, "detail": d} for k, (ok, d) in checks.items()},
         "warnings": warnings, "memory_guard": guard,
@@ -590,6 +630,17 @@ def print_report(s: dict, out: str):
         print(f"  {n:28s} {m['avail_start']}/{m['avail_min']}/{m['avail_end']}  slope {m['avail_slope_gib_h']}"
               f"  rss {m['rss_max']}")
     print(f"kept_bytes max {s['kept_bytes_max_gib']} GiB; spill {s['spill_end']}; spill during run {s['spill']}")
+    for name, p in s["phases"].items():
+        if p.get("big_turns"):
+            print(f"  {name}: {p['big_turns']} turns adding {BIG_TURN}+ tokens: ttft p95 {p['big_ttft_p95']} s, "
+                  f"queued p50 {p['big_queue_s_p50']} s (ttft minus the server's own prefill)")
+    w = s.get("slow_waits") or []
+    if w:
+        held = statistics.fmean(x["held_share"] for x in w)
+        print(f"slow turns (ttft > {SLOW_TTFT_S} s): {len(w)}; a request held in {held:.0%} of their wait, "
+              f"{statistics.fmean(x['prefilling_avg'] for x in w):.1f} prompts prefilling at once, pool free min "
+              f"{min(x['pool_free_min'] for x in w):.0%}: {'room or slots' if held >= 0.5 else 'fill order'} "
+              f"is the limit")
     if s["big_misses"]:
         print(f"big re-prefills ({len(s['big_misses'])}):")
         for b in s["big_misses"][:10]:
