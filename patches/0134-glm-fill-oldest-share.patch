@@ -1,0 +1,107 @@
+# TF_GLM_FILL_OLDEST_ROWS (issue #199): the oldest waiting prompt takes a share of every multi-prompt chunk. With
+# TF_GLM_MULTI_PREFILL=1, _group packed waiting prompts into each prompt chunk shortest first, so a long prompt got
+# rows only after every shorter one had its share: under 8 agents (3 Sparks, 2026-11-21) a 100k-200k tool output
+# waited a median 93-109 s before its own prefill even ran, with ~4.5 prompts filling at once and the pool 15-67%
+# free (not room: a request was held in 6-19% of those waits). next_fill already picks the oldest waiting prompt as
+# ``first``; _group only checked it could share a chunk. Now, with TF_GLM_FILL_OLDEST_ROWS=<rows> (a multiple of the
+# fill unit up to TF_GLM_FILL_ROWS), ``first`` goes in first and takes up to that many rows, the others follow
+# shortest first, and ``first`` takes what they leave. 0 (the default): the packing is unchanged (checked against a
+# copy of it on 3,000 random sets). Rank 0 decides; the MFILL message carries the pieces, so the other ranks change
+# nothing. Same replies: a token's result does not depend on the chunk it fills in. CPU check:
+# tools/fill_oldest_check.py. Applies after 0049 (and 0062's sliced fills, which take the same group).
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -169,6 +169,20 @@
+     if rows < 64 or rows % 64 or rows > prefill_rows or (grid and rows % grid):
+         raise ValueError(f"TF_GLM_FILL_ROWS: a multiple of 64{f' and of the {grid}-token prompt grid' if grid else ''}"
+                          f" up to the {prefill_rows}-row prompt chunk, not {value!r}")
++    return rows
++
++
++def fill_oldest_rows(fill: int, unit: int, value: str | None = None) -> int:
++    """TF_GLM_FILL_OLDEST_ROWS: rows of every multi-prompt chunk the oldest waiting prompt takes before the others are
++    packed shortest first (0, the default: none, every prompt shortest first). A multiple of the fill unit (64 and
++    the prompt grid), at most TF_GLM_FILL_ROWS."""
++
++    value = os.environ.get("TF_GLM_FILL_OLDEST_ROWS", "") if value is None else value
++    value = value.strip()
++    rows = 0 if value == "" else int(value) if value.isdecimal() else -1
++    if rows and (rows < unit or rows % unit or rows > fill):
++        raise ValueError(f"TF_GLM_FILL_OLDEST_ROWS: 0, or a multiple of {unit} up to the {fill}-row fill chunk "
++                         f"(TF_GLM_FILL_ROWS), not {value!r}")
+     return rows
+ 
+ 
+@@ -644,6 +658,7 @@
+             if not latent.ENABLED:
+                 raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+         self.unit = fill_unit(self.grid)
++        self.oldest_rows = fill_oldest_rows(self.fill_rows, self.unit)  # rank 0's _group; MFILL tells the others
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
+@@ -2712,7 +2727,12 @@
+         streams before background ones, then the fewest prompt rows left first (a short prompt's first token does not
+         wait behind a long prompt; the long one takes the rest of the budget), then admission order; each takes the
+         rows to its next stop (a kept point or its end) when they fit, else the budget left in whole ``fill_unit``s.
+-        Image prompts and replays of a kept head fill alone."""
++        Image prompts and replays of a kept head fill alone.
++
++        TF_GLM_FILL_OLDEST_ROWS (``oldest_rows``, 0: off): ``first`` (next_fill's pick, the oldest waiting prompt)
++        goes in first and takes up to that many rows, then the others shortest first, then ``first`` takes what they
++        left. Shortest first alone gave a long prompt no rows for as long as shorter ones kept arriving (issue #199:
++        a 100k-200k tool output waited minutes behind newer, shorter prompts)."""
+ 
+         def plain(l: Lane) -> bool:
+             return not l.decoding and l.feed is None and l.head is None
+@@ -2720,14 +2740,20 @@
+         if not plain(first):
+             return None
+         busy = any(l.decoding and not l.s.done for l in self.lanes.values())
+-        left = self.fill_rows if busy else self.e.prefill_rows
++        left = budget = self.fill_rows if busy else self.e.prefill_rows
+         lanes = sorted((l for l in self.lanes.values() if plain(l)),
+                        key=lambda l: (bool(l.s.background), len(l.s.prompt) - l.st.pos, l.order))
++        share = self.oldest_rows
++        if share:
++            lanes.remove(first)
++            lanes.insert(0, first)
+         out: list[tuple[Lane, int]] = []
+         for l in lanes:
+             pos, n = l.st.pos, len(l.s.prompt)
+             stop = next((p for p in l.stops if p > pos), n)
+             room = min(left, self.fill_rows if l.s.background else left)
++            if share and l is first:
++                room = min(room, share)
+             if stop - pos > room:
+                 stop = pos + room // self.unit * self.unit
+             if stop <= pos:
+@@ -2736,6 +2762,14 @@
+             left -= stop - pos
+             if left <= 0:
+                 break
++        if share and left > 0 and out and out[0][0] is first:
++            pos, stop = first.st.pos, out[0][1]
++            end = next((p for p in first.stops if p > pos), len(first.s.prompt))
++            cap = self.fill_rows if first.s.background else budget
++            total = min(end - pos, stop - pos + left, cap)
++            grown = end if pos + total == end else pos + total // self.unit * self.unit
++            if grown > stop:
++                out[0] = (first, grown)
+         return out if len(out) > 1 else None
+ 
+     def _ends(self, lane: Lane) -> tuple[int, ...]:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -964,7 +964,8 @@
+                       f"in one pool of {pool_rows} tokens (each up to {self.limit}), their verify windows "
+                       f"{self.multi.window} rows together (TF_GLM_MULTI_WINDOW); DFlash2 drafts, prompt chunks of "
+                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
+-                      f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
++                      f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}"
++                      f"{f', the oldest {self.multi.oldest_rows} rows of each first (TF_GLM_FILL_OLDEST_ROWS)' if self.multi.group and self.multi.oldest_rows else ''}; "
+                       f"{self.multi.tune.describe()}"
+                       f"{f'; prompt layer slices target {self.multi.fill_budget:g} ms' if self.multi.fill_budget else ''}", flush=True)
+                 if self.multi.row_ms is not None:

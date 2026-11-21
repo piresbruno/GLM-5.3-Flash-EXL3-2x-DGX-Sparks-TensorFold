@@ -313,6 +313,12 @@ FILL_DRAFTS="${FILL_DRAFTS:-1}"
 _fill_max="${TF_GLM_PREFILL_ROWS:-2048}"
 FILL_ROWS="${FILL_ROWS:-${TF_GLM_FILL_ROWS:-$(( _fill_max < 2048 ? _fill_max : 2048 ))}}"
 export TF_GLM_FILL_BUDGET_MS="$FILL_BUDGET_MS" TF_GLM_FILL_DRAFTS="$FILL_DRAFTS" TF_GLM_FILL_ROWS="$FILL_ROWS"
+# FILL_OLDEST_ROWS (patch 0134, issue #199; TensorFold's TF_GLM_FILL_OLDEST_ROWS): rows of every multi-prompt chunk
+# the oldest waiting prompt takes before the others go in shortest first, then it takes what they leave. 0 (default):
+# shortest first only, where a long prompt gets no rows while shorter ones keep arriving (a 100k-200k tool output
+# under 8 agents waited a median ~100 s before its own prefill ran). A multiple of 64 up to FILL_ROWS. Same replies.
+FILL_OLDEST_ROWS="${FILL_OLDEST_ROWS:-${TF_GLM_FILL_OLDEST_ROWS:-0}}"
+export TF_GLM_FILL_OLDEST_ROWS="$FILL_OLDEST_ROWS"
 # L2 prefetch in decode windows (patch 0046, adapted from jayleaton/glm53-tensorfold-spark's patch 0460): a side stream
 # brings the weights the next kernels read into L2 during each layer's all-gathers. 1 (default): one request's prose
 # 48.36 -> 49.46 tok/s, code 59.54 -> 61.08 (two boots each). Same bits. 0: off.

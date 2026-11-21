@@ -5,6 +5,15 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **The oldest waiting prompt takes a share of every multi-prompt chunk** (patch `0134-glm-fill-oldest-share`,
+  `FILL_OLDEST_ROWS`, issue #199; off by default): `TF_GLM_MULTI_PREFILL` packed each prompt chunk shortest first, so
+  a long prompt got rows only after every shorter one. Under 8 agents on three Sparks a 100k-200k tool output waited
+  a median 93-109 s before its own prefill ran, with ~4.5 prompts filling at once and the pool 15-67% free. In a
+  2,048-row chunk with six newer short prompts waiting, the 150k prompt got 0 rows. With `FILL_OLDEST_ROWS=<rows>`
+  the oldest waiting prompt (the one `next_fill` already picks) goes in first and takes up to that many rows, the
+  others follow shortest first, and it takes what they leave. Rank 0 decides; the other ranks apply its `MFILL`. Same
+  replies. Off is the packing as before, checked on 3,000 random sets. CPU check: `tools/fill_oldest_check.py`.
+
 - **Every rank ends when a rank it needs is gone** (patch `0133-cuda-peer-watch`, upstream PR #138 by
   [BadAd84](https://github.com/BadAd84), its 0131 renumbered): a thread on each rank checks in with the rendezvous
   store every 2 s. Rank 0 exits (code 1) when another rank shows no sign of life for `TENSORFOLD_PEER_TIMEOUT_S`
