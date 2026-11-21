@@ -5,6 +5,20 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **Long-session stress test and spill-prune probe** (`tools/long_sessions.py`, `tools/spill_prune_probe.py`): agent
+  sessions shaped on production's 2026-11-19 spill store (turn sizes, think times, a 10.8k shared system block),
+  growing to 230k tokens, in phases (`--phases`, default 2, 8, then 12 sessions, an idle gap and a return turn each).
+  Every later turn's cached tokens are checked against the prefix it shares with the turn before, the 157k-180k
+  re-prefills of 2026-11-12. The other checks: recall of a fact on side branches at every depth, `MemAvailable` and
+  tensorfold RSS on every Spark (it stops sending at `GUARD_GIB`, above earlyoom's line), kept/spill gauges, paused
+  streams and 429s. `--replay DIR` sends `real_replay.py`'s stored conversations as ids instead, counting only.
+  `spill_prune_probe.py` builds ~200k-token conversations, runs agent pressure without touching them and watches
+  rank 0's `points/` folder for when each is pruned, then times a resume. At `PARALLEL=8` with 3 ranks, 32 GiB spill,
+  52 + 23 min: 0 errors, later turns resumed p10 100%, recall 119/119 (up to 230k), memory flat, and a ~200k
+  context came back in 0.8-2.1 s. Under 8 agents (spill written at ~2.2 GiB/min) an idle ~192k conversation is pruned
+  after 30-33 min, down to its ~10k opening, and resuming it then takes 83 s. Offline tests:
+  `tests/test_long_sessions.py`.
+
 - **`./start.sh` no longer mistakes a running container for a serving one**: it skipped the start whenever the
   containers were up, even when rank 0 had been left on another port (a harness that injects `PORT`, as the irori
   driver does) or was wedged. The engine kept its unified memory while `:8081` stayed dead, and every later
