@@ -28,6 +28,7 @@
 #            WORKER_WEIGHTS (copy | nfs: rank 1 reads the head's HF_CACHE over NFS), NFS_PATH, NFS_SERVER, NFS_VOLUME,
 #            WORKER_WEIGHTS2, NFS_SERVER2,
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
+#            CUDA_ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF for every rank; default expandable_segments:True, "" unsets)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
@@ -41,6 +42,7 @@
 #            e.g.
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS (scripts/config.sh: MAX_IMAGES x
 #            IMAGE_TOKENS), TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
+#            MALLOC_ARENA_MAX (2) goes to every rank too: glibc's malloc arenas (issue #154)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -159,9 +161,14 @@ need_workers
 # ---------------------------------------------------------------- already running?
 all_running() { local i; running_here || return 1; for i in $(worker_ids); do running_worker "$i" || return 1; done; }
 if (( ! DRY )) && [[ "$MODE" == start ]] && all_running; then
-  log "$CONTAINER_NAME is already running on $SPARKS (model: $(served_name || echo "not answering yet"), port $PORT): nothing to do."
-  log "Use ./start.sh restart to restart it (e.g. with new settings), or ./stop.sh to stop it."
-  exit 0
+  # A running container is not a serving one: a harness that injects PORT can leave it on another port, or it can be
+  # wedged. Skip only when the API answers on this start's $PORT; otherwise fall through to the stop and start below.
+  if served=$(served_name) && [[ -n "$served" ]]; then
+    log "$CONTAINER_NAME is already running on $SPARKS (model: $served, port $PORT): nothing to do."
+    log "Use ./start.sh restart to restart it (e.g. with new settings), or ./stop.sh to stop it."
+    exit 0
+  fi
+  log "$CONTAINER_NAME is running on $SPARKS but $URL is not answering: stopping it, then starting again"
 fi
 
 # ---------------------------------------------------------------- 1. setup
@@ -311,7 +318,8 @@ fi
 # passes as set, as in v1.4 (unset: the ranks take NCCL_IB_HCA's devices).
 env_args() {
   local _skip='^$' name
-  ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
+  ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" -e MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}")
+  [[ -n "${CUDA_ALLOC_CONF:-}" ]] && ENV_ARGS+=(-e PYTORCH_CUDA_ALLOC_CONF="$CUDA_ALLOC_CONF")
   (( TP == 2 )) || _skip='^TF_ROCE_HCA='
   while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
 }
